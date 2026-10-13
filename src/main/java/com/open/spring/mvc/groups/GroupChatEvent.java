@@ -25,4 +25,8 @@ public class GroupChatEvent {
     private String error;
     private List<String> participants;
     private boolean edited;
+    /** See {@link GroupChatMessage} for these three. */
+    private String replyToId;
+    private String threadId;
+    private boolean alsoInChannel;
 }

@@ -23,10 +23,23 @@ public class GroupChatRealtimeService {
     private final SimpMessagingTemplate messagingTemplate;
 
     public GroupChatEvent publishMessage(Long groupId, String sender, String message, String image) {
+        return publishMessage(groupId, sender, message, image, null, null, false);
+    }
+
+    /**
+     * Same as {@link #publishMessage(Long, String, String, String)} for a reply ({@code replyToId})
+     * and/or a thread reply ({@code threadId}, optionally {@code alsoInChannel}). Throws
+     * {@link IllegalArgumentException} if a link doesn't point at a message in this group.
+     */
+    public GroupChatEvent publishMessage(Long groupId, String sender, String message, String image,
+                                         String replyToId, String threadId, boolean alsoInChannel) {
         Groups group = getGroupOrThrow(groupId);
 
         String date = Instant.now().toString();
         GroupChatMessage persisted = new GroupChatMessage(sender, message, date, image);
+        persisted.setReplyToId(replyToId);
+        persisted.setThreadId(threadId);
+        persisted.setAlsoInChannel(alsoInChannel);
         groupChatService.addMessage(group.getName(), persisted);
 
         GroupChatEvent event = GroupChatEvent.builder()
@@ -37,6 +50,9 @@ public class GroupChatRealtimeService {
                 .message(message)
                 .image(image)
                 .date(date)
+                .replyToId(persisted.getReplyToId())
+                .threadId(persisted.getThreadId())
+                .alsoInChannel(persisted.isAlsoInChannel())
                 .build();
 
         broadcastToGroup(groupId, event);

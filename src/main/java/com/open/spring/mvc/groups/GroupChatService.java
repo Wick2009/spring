@@ -89,19 +89,42 @@ public class GroupChatService {
         return messages;
     }
 
+    /**
+     * Throws {@link IllegalArgumentException} if the message's reply or thread link
+     * doesn't point at a message in this group (see {@link #checkLinks}).
+     */
     public List<GroupChatMessage> addMessage(String groupName, GroupChatMessage message) {
         List<GroupChatMessage> messages = getMessages(groupName);
+        checkLinks(messages, message);
         messages.add(message);
-
-        String jsonl = messages.stream()
-                .map(this::toJson)
-                .collect(Collectors.joining("\n"));
-
-        String base64Data = Base64.getEncoder()
-                .encodeToString(jsonl.getBytes(StandardCharsets.UTF_8));
-
-        s3FileHandler.uploadFile(base64Data, MESSAGES_FILE, groupName);
+        saveMessages(groupName, messages);
         return messages;
+    }
+
+    /**
+     * A reply must quote a message in this group, and a thread reply must hang off a
+     * top-level message: threads don't nest. Blank ids count as no link, and
+     * alsoInChannel is dropped when there's no thread.
+     */
+    private void checkLinks(List<GroupChatMessage> messages, GroupChatMessage message) {
+        if (isBlank(message.getReplyToId())) {
+            message.setReplyToId(null);
+        } else if (findById(messages, message.getReplyToId()) == null) {
+            throw new IllegalArgumentException("The message being replied to doesn't exist");
+        }
+
+        if (isBlank(message.getThreadId())) {
+            message.setThreadId(null);
+            message.setAlsoInChannel(false);
+            return;
+        }
+        GroupChatMessage root = findById(messages, message.getThreadId());
+        if (root == null) {
+            throw new IllegalArgumentException("The thread doesn't exist");
+        }
+        if (root.getThreadId() != null) {
+            throw new IllegalArgumentException("Threads can't be nested");
+        }
     }
 
     /**
@@ -114,58 +137,66 @@ public class GroupChatService {
     public boolean editMessage(String groupName, String messageId, String newMessage, String requesterDisplayName) {
         if (messageId == null) return false;
         List<GroupChatMessage> messages = getMessages(groupName);
-        boolean found = false;
-        for (GroupChatMessage m : messages) {
-            if (messageId.equals(m.getId())) {
-                if (requesterDisplayName == null || !requesterDisplayName.equals(m.getName())) {
-                    throw new SecurityException("Not the message sender");
-                }
-                m.setMessage(newMessage);
-                m.setEdited(true);
-                found = true;
-                break;
-            }
+        GroupChatMessage target = findById(messages, messageId);
+        // A deleted message that was kept for its thread can't be brought back by editing.
+        if (target == null || target.isDeleted()) {
+            return false;
         }
-
-        if (found) {
-            String jsonl = messages.stream()
-                    .map(this::toJson)
-                    .collect(Collectors.joining("\n"));
-
-            String base64Data = Base64.getEncoder()
-                    .encodeToString(jsonl.getBytes(StandardCharsets.UTF_8));
-
-            s3FileHandler.uploadFile(base64Data, MESSAGES_FILE, groupName);
+        if (requesterDisplayName == null || !requesterDisplayName.equals(target.getName())) {
+            throw new SecurityException("Not the message sender");
         }
-        return found;
+        target.setMessage(newMessage);
+        target.setEdited(true);
+        saveMessages(groupName, messages);
+        return true;
     }
 
-    /** Same ownership rule as {@link #editMessage}; throws {@link SecurityException} on mismatch. */
+    /**
+     * Same ownership rule as {@link #editMessage}; throws {@link SecurityException} on mismatch.
+     * A message with thread replies is kept as an empty, deleted message so the thread
+     * survives; any other message is removed.
+     */
     public void deleteMessage(String groupName, String messageId, String requesterDisplayName) {
         if (messageId == null) return;
         List<GroupChatMessage> messages = getMessages(groupName);
 
-        GroupChatMessage target = messages.stream()
-                .filter(m -> messageId.equals(m.getId()))
-                .findFirst()
-                .orElse(null);
-        if (target == null) return;
+        GroupChatMessage target = findById(messages, messageId);
+        if (target == null || target.isDeleted()) return;
         if (requesterDisplayName == null || !requesterDisplayName.equals(target.getName())) {
             throw new SecurityException("Not the message sender");
         }
 
-        boolean removed = messages.remove(target);
-
-        if (removed) {
-            String jsonl = messages.stream()
-                    .map(this::toJson)
-                    .collect(Collectors.joining("\n"));
-
-            String base64Data = Base64.getEncoder()
-                    .encodeToString(jsonl.getBytes(StandardCharsets.UTF_8));
-
-            s3FileHandler.uploadFile(base64Data, MESSAGES_FILE, groupName);
+        boolean hasThread = messages.stream().anyMatch(m -> messageId.equals(m.getThreadId()));
+        if (hasThread) {
+            target.setDeleted(true);
+            target.setMessage("");
+            target.setImage(null);
+        } else {
+            messages.remove(target);
         }
+        saveMessages(groupName, messages);
+    }
+
+    private void saveMessages(String groupName, List<GroupChatMessage> messages) {
+        String jsonl = messages.stream()
+                .map(this::toJson)
+                .collect(Collectors.joining("\n"));
+
+        String base64Data = Base64.getEncoder()
+                .encodeToString(jsonl.getBytes(StandardCharsets.UTF_8));
+
+        s3FileHandler.uploadFile(base64Data, MESSAGES_FILE, groupName);
+    }
+
+    private static GroupChatMessage findById(List<GroupChatMessage> messages, String id) {
+        return messages.stream()
+                .filter(m -> id.equals(m.getId()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     public List<Map<String, String>> listSharedFiles(String groupName) {
