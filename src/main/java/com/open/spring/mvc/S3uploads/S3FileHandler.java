@@ -1,9 +1,15 @@
 package com.open.spring.mvc.S3uploads;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.List;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -45,12 +51,26 @@ public class S3FileHandler implements FileHandler {
     @Value("${aws.s3.region}")
     private String region;
 
+    // Local development usually has no AWS keys. Without this fallback every call
+    // below fails, so group chat history, edits and uploads can't be tried locally.
+    // Set it to an empty value to turn the fallback off.
+    @Value("${file.local-fallback-dir:volumes/uploads}")
+    private String localFallbackDir;
+
     private S3Client s3Client;
+
+    // Set only when S3 isn't configured and the local fallback is on.
+    private Path localRoot;
 
     @PostConstruct
     public void init() {
         if (isBlank(accessKey) || isBlank(secretKey) || isBlank(region) || isBlank(bucketName)) {
-            log.warn("S3 is disabled: missing AWS credentials/region/bucket. Upload API will return errors until configured.");
+            if (isBlank(localFallbackDir)) {
+                log.warn("S3 is disabled: missing AWS credentials/region/bucket. Upload API will return errors until configured.");
+            } else {
+                localRoot = Paths.get(localFallbackDir.trim()).toAbsolutePath().normalize();
+                log.warn("S3 is not configured (missing AWS credentials/region/bucket): storing files on local disk under {}. Local development only.", localRoot);
+            }
             return;
         }
 
@@ -65,6 +85,9 @@ public class S3FileHandler implements FileHandler {
     @Override
     public String uploadFile(String base64Data, String filename, String uid) {
         if (s3Client == null) {
+            if (localRoot != null) {
+                return localUpload(generateKey(uid, filename), base64Data) ? filename : null;
+            }
             log.warn("S3 upload attempted but S3 client is not configured.");
             return null;
         }
@@ -91,6 +114,9 @@ public class S3FileHandler implements FileHandler {
     @Override
     public String decodeFile(String uid, String filename) {
         if (s3Client == null) {
+            if (localRoot != null) {
+                return localDecode(generateKey(uid, filename));
+            }
             log.warn("S3 download attempted but S3 client is not configured.");
             return null;
         }
@@ -117,6 +143,9 @@ public class S3FileHandler implements FileHandler {
     @Override
     public boolean deleteFiles(String uid) {
         if (s3Client == null) {
+            if (localRoot != null) {
+                return localDelete(uid + "/");
+            }
             log.warn("S3 delete attempted but S3 client is not configured.");
             return false;
         }
@@ -157,6 +186,9 @@ public class S3FileHandler implements FileHandler {
     @Override
     public List<String> listFiles(String prefix) {
         if (s3Client == null) {
+            if (localRoot != null) {
+                return localList(prefix);
+            }
             log.warn("S3 list attempted but S3 client is not configured.");
             return new ArrayList<>();
         }
@@ -181,6 +213,9 @@ public class S3FileHandler implements FileHandler {
     @Override
     public boolean fileExists(String uid, String filename) {
         if (s3Client == null) {
+            if (localRoot != null) {
+                return localExists(generateKey(uid, filename));
+            }
             log.warn("S3 fileExists check attempted but S3 client is not configured.");
             return false;
         }
@@ -198,6 +233,96 @@ public class S3FileHandler implements FileHandler {
 
     private String generateKey(String uid, String filename) {
         return uid + "/" + filename;
+    }
+
+    // --- Local disk fallback: same keys as S3, stored as files under localRoot ---
+
+    // S3 keys are flat strings, so a key could hold "../". Refuse anything that
+    // would land outside the storage folder.
+    private Path localPath(String key) {
+        Path path = localRoot.resolve(key).normalize();
+        if (!path.startsWith(localRoot)) {
+            throw new IllegalArgumentException("Key leaves the local storage folder: " + key);
+        }
+        return path;
+    }
+
+    private boolean localUpload(String key, String base64Data) {
+        try {
+            Path path = localPath(key);
+            // A key ending in "/" is S3's empty-folder placeholder.
+            if (key.endsWith("/")) {
+                Files.createDirectories(path);
+            } else {
+                Files.createDirectories(path.getParent());
+                Files.write(path, Base64.getDecoder().decode(base64Data));
+            }
+            return true;
+        } catch (IOException | IllegalArgumentException e) {
+            log.warn("Local upload failed for key {}: {}", key, e.getMessage());
+            return false;
+        }
+    }
+
+    private String localDecode(String key) {
+        try {
+            Path path = localPath(key);
+            if (!Files.isRegularFile(path)) {
+                return null;
+            }
+            return Base64.getEncoder().encodeToString(Files.readAllBytes(path));
+        } catch (IOException | IllegalArgumentException e) {
+            log.warn("Local download failed for key {}: {}", key, e.getMessage());
+            return null;
+        }
+    }
+
+    private boolean localDelete(String prefix) {
+        try {
+            Path dir = localPath(prefix);
+            if (dir.equals(localRoot)) {
+                throw new IllegalArgumentException("Refusing to delete the whole storage folder");
+            }
+            if (!Files.exists(dir)) {
+                return true;
+            }
+            try (Stream<Path> paths = Files.walk(dir)) {
+                for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                    Files.delete(path);
+                }
+            }
+            return true;
+        } catch (IOException | IllegalArgumentException e) {
+            log.warn("Local delete failed for prefix {}: {}", prefix, e.getMessage());
+            return false;
+        }
+    }
+
+    // Lists files only, like S3 lists objects; folder placeholders are skipped
+    // (callers already filter those out of S3 results).
+    private List<String> localList(String prefix) {
+        if (!Files.isDirectory(localRoot)) {
+            return new ArrayList<>();
+        }
+        try (Stream<Path> paths = Files.walk(localRoot)) {
+            return paths.filter(Files::isRegularFile)
+                    .map(path -> localRoot.relativize(path).toString().replace('\\', '/'))
+                    .filter(key -> key.startsWith(prefix))
+                    .sorted()
+                    .collect(Collectors.toList());
+        } catch (IOException e) {
+            log.warn("Local list failed for prefix {}: {}", prefix, e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
+    private boolean localExists(String key) {
+        try {
+            Path path = localPath(key);
+            return key.endsWith("/") ? Files.isDirectory(path) : Files.isRegularFile(path);
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
     }
 
     private boolean isBlank(String value) {
